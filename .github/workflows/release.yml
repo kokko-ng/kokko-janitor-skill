@@ -3,7 +3,7 @@ name: Release
 # release.yml is the SOLE publisher of GitHub releases: it fires after the CI
 # workflow succeeds on main (or on manual dispatch). Version bumps merge to
 # main like any other change; no one runs `gh release create` by hand.
-# Shared-infra note: .github/workflows/release.yml in kokko-cmds is the
+# Shared-infra note: .github/workflows/release.yml in kokko-skills is the
 # reference copy of this workflow.
 on:
   workflow_run:

@@ -5,7 +5,7 @@
 # (push policy, nothing-found rules) live OUTSIDE the markers. Unenforced,
 # the copies drift -- one skill banned `git clean`, another did not -- and
 # deliberate deltas become indistinguishable from accidents. Mirrors
-# check-skill-sync.sh in kokko-cmds, which holds the reference mechanism.
+# check-skill-sync.sh in kokko-skills, which holds the reference mechanism.
 set -euo pipefail
 
 START='<!-- shared:git-safety-core start'

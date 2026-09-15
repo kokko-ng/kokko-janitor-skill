@@ -25,7 +25,7 @@ repos:
     rev: v0.11.0.1
     hooks:
       - id: shellcheck
-        # Same args as the kokko-cmds reference config: info-level findings
+        # Same args as the kokko-skills reference config: info-level findings
         # and -x so sourced files are followed.
         args: [--severity=info, -x]
 

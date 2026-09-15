@@ -26,12 +26,16 @@ codebase can only get better between runs, and regressions are loud.
 ## Install
 
 ```text
-/plugin marketplace add kokko-ng/kokko-janitor
+/plugin marketplace add kokko-ng/kokko-janitor-skill
 /plugin install kokko-janitor@kokko-ng-kokko-janitor
 ```
 
+The marketplace ID stays `kokko-ng-kokko-janitor` (the repository was
+named kokko-janitor until 2026-09-15), so existing installs keep working
+unchanged.
+
 The lint layer invokes the check skills from
-[kokko-cmds](https://github.com/kokko-ng/kokko-cmds)' `kokko-code-quality`
+[kokko-skills](https://github.com/kokko-ng/kokko-skills)' `kokko-code-quality`
 plugin — install that too, or run with the design layer only.
 
 ## Usage
@@ -75,7 +79,7 @@ nothing is evidence the codebase is actually clean — the same finding
 surviving multiple passes unfixed is evidence of a blocker. Chain targets
 with `then` to run ordered sets, and `--pre '...'` for a one-time setup
 step (e.g. deploy before validating). Pairs with the `tailor` skill from
-kokko-cmds' kokko-validation plugin, which writes repo-specific prompt
+kokko-skills' kokko-validation plugin, which writes repo-specific prompt
 files to `prompts/`.
 
 ## Design principles
@@ -97,7 +101,7 @@ files to `prompts/`.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the test suite, pre-commit
 setup, ruff, and the CI-gated release flow. Shared infrastructure
 (release workflow, sync script, pre-commit config) follows
-[kokko-cmds](https://github.com/kokko-ng/kokko-cmds).
+[kokko-skills](https://github.com/kokko-ng/kokko-skills).
 
 ## License
 
