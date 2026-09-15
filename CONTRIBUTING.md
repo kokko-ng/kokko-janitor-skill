@@ -37,5 +37,5 @@ script run as a subprocess, JSON parsed, no mocks.
 
 The shared infra here (release workflow, marketplace sync script,
 pre-commit config, gitignore) follows
-[kokko-cmds](https://github.com/kokko-ng/kokko-cmds), which holds the
+[kokko-skills](https://github.com/kokko-ng/kokko-skills), which holds the
 reference copies. When changing any of it, keep the two repos convergent.

@@ -5,7 +5,7 @@
 #   - every plugins/*/ directory is listed in marketplace.json
 #   - all listed plugin versions are identical (lock-step versioning)
 #
-# Shared-infra note: kokko-cmds/scripts/check-marketplace-sync.sh is the
+# Shared-infra note: kokko-skills/scripts/check-marketplace-sync.sh is the
 # reference copy of this script; keep the two convergent when changing either.
 set -euo pipefail
 
