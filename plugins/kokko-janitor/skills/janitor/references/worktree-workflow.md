@@ -56,9 +56,9 @@ Create all needed worktrees upfront to allow parallel execution.
 
 ## Step 4: Launch Subagents
 
-Spawn one subagent per worktree using the Task tool. A subagent's
-working directory RESETS between Bash calls — never rely on `cd`
-persisting. Brief each subagent to use absolute paths everywhere and
+Spawn one subagent per worktree using the Task tool. A subagent starts in
+the repo root, not in its worktree, and a `cd` is easy to lose across Bash
+calls. Brief each subagent to use absolute paths everywhere and
 `git -C "$WORKTREE"` for every git command:
 
 Always invoke the check skills by their namespaced name
@@ -68,9 +68,9 @@ collision silently runs the wrong skill.
 
 ```text
 Task: Run /kokko-code-quality:security py in worktree
-Prompt: WORKTREE=$WORKTREE_BASE/py-security (absolute path — your cwd
-        resets between Bash calls, so never rely on cd; reference files
-        by absolute path under "$WORKTREE" and run every git command as
+Prompt: WORKTREE=$WORKTREE_BASE/py-security (absolute path — you start
+        in the repo root, not in the worktree; reference files by
+        absolute path under "$WORKTREE" and run every git command as
         git -C "$WORKTREE" ...). Run /kokko-code-quality:security py
         against that worktree. Fix ALL issues found, commit
         incrementally with git -C "$WORKTREE" commit.
@@ -213,9 +213,3 @@ git cherry-pick <commit-sha>
 Do NOT fall back to `git rebase` — it rewrites history and destroys
 uncommitted tracked changes without prompting. If cherry-picking also
 fails, stop and report the state to the user.
-
-## Optimization Tips
-
-1. **Parallelize aggressively** - Launch all subagents at once
-2. **Merge order** - Merge smaller changesets first to minimize conflicts
-3. **Skip empty branches** - Don't merge branches with no commits

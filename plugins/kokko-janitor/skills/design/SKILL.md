@@ -32,8 +32,8 @@ its importers (3-5 files) to see how it is actually used. Identify:
 ## Step 2: Verdict
 
 **`cohesive`** — one responsibility, or responsibilities so entangled that
-splitting adds indirection without clarity. Size alone is NOT a defect. A
-529-line module with one clear job is fine. Report the verdict with one
+splitting adds indirection without clarity. Size alone is not a defect: a
+large module with one clear job is fine. Report the verdict with one
 paragraph of reasoning and STOP. This outcome is common and correct —
 never invent a split to justify the invocation.
 
