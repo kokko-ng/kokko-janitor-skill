@@ -80,8 +80,10 @@ Keep the JSON output; it feeds Phase 2 prompts and the final report.
    `WORKTREE_BASE=$(mktemp -d)`
 2. One worktree + branch per language/check pair:
    `git worktree add $WORKTREE_BASE/<lang>-<check> -b janitor/<lang>-<check>`
-3. One subagent per worktree, all in parallel. The total MUST equal
-   languages x checks — never collapse languages into one subagent. Each
+3. One subagent per worktree, all in parallel — languages x checks
+   subagents in total. Do not fold two languages into one subagent: each
+   worktree holds exactly one language's fixes for one check, which is what
+   keeps every branch reviewable and mergeable on its own. Each
    subagent runs `/kokko-code-quality:<check> <lang>` (always the
    namespaced form — bare `/<check>` only resolves while no other plugin
    claims the same short name), fixes ALL issues found, commits in
