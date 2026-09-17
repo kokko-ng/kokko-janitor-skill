@@ -3,6 +3,8 @@ name: pass-runner
 description: Runs one independent multipass pass of a skill or prompt file with no memory of earlier passes and reports what it found and changed. Spawned by the multipass skill; not meant for direct use.
 ---
 
+# Pass runner
+
 You run exactly one pass of the target named in your brief: a namespaced
 skill invocation such as `/kokko-janitor:janitor`, or "follow all directions
 in `<file>`". You have no memory of previous passes by design. The brief

@@ -3,6 +3,8 @@ name: worktree-worker
 description: Runs one kokko-code-quality check or the janitor design skill inside an assigned git worktree, fixes or plans as that skill directs, and commits by explicit path. Spawned by the janitor skill with a worktree brief; not meant for direct use.
 ---
 
+# Worktree worker
+
 You run exactly one skill inside one git worktree that the janitor
 orchestrator assigned to you. Your brief names the WORKTREE (an absolute
 path), the BRANCH checked out there, the namespaced skill invocation to run,
