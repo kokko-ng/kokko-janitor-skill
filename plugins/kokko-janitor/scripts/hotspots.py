@@ -3,21 +3,35 @@
 
 Signals per file:
   loc      non-blank lines of code
-  defs     top-level and nested function/class definitions (Python only)
-  fan_in   number of project files importing this module (Python only)
-  fan_out  number of project modules this file imports (Python only)
+  defs     function/class definitions (Python via ast; JS/TS/Vue via
+           regexes over the script source)
+  fan_in   number of project files importing this module (Python, JS/TS/Vue)
+  fan_out  number of project modules this file imports (Python, JS/TS/Vue)
   churn    commits touching this file (git log, rename-aware)
 
 The composite score is computed over a FIXED five-signal vector: every
 signal is normalised to [0, 1] against the repo-wide maximum, missing
 signals count as 0, and the mean is taken over all five. That keeps ranks
-comparable across languages (a two-signal .ts file cannot out-score a
+comparable across languages (a two-signal .go file cannot out-score a
 five-signal .py file by dilution). The score orders candidates only; the
 absolute `candidate` flag (loc >= --candidate-loc or defs >=
 --candidate-defs) is the gate for design review.
 
+Python structure comes from `ast`. JavaScript, TypeScript and Vue
+single-file components (their <script> blocks; LOC still counts the whole
+file) are scanned with regexes after comments and string contents are
+blanked: defs are function and class declarations, const/let/var-bound
+arrow or function expressions, and class or object-literal methods;
+imports resolve relative and @/ ~/ alias specifiers against the analysed
+files (bare package names are external). It is a heuristic, not a parser.
+
 Also reports temporal coupling: pairs of high-churn files that repeatedly
 change in the same commit but live in different directories.
+
+Per-repo config: .kokko.json at the repo root (or --config PATH, relative
+paths resolving against the repo root) may add "excludes" globs and set
+"janitor": {"candidate_loc", "candidate_defs"} defaults. Explicit flags
+win; other keys belong to other tools and are ignored.
 
 Scorecard ratchet: --scorecard PATH (relative paths resolve against the
 target repo root) compares absolute structural metrics (max loc, max
@@ -33,13 +47,23 @@ import ast
 import fnmatch
 import json
 import os
+import posixpath
+import re
 import subprocess
 import sys
 import tempfile
 from collections import defaultdict
 from itertools import combinations
 
-SOURCE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".cs", ".go", ".rb", ".java"}
+# Files given regex-based structural analysis (defs, fan-in/out); .vue is
+# analysed over its <script> blocks only.
+JS_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue"}
+# Extensions tried, in order, for an extensionless or directory import.
+JS_RESOLVE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue")
+SOURCE_EXTS = {".py", ".cs", ".go", ".rb", ".java"} | JS_EXTS
+CONFIG_FILENAME = ".kokko.json"
+DEFAULT_CANDIDATE_LOC = 400
+DEFAULT_CANDIDATE_DEFS = 30
 # Path-anchored test patterns: never bare "*test*", which drops
 # latest_prices.py, contest.py, attestation.py and friends.
 DEFAULT_EXCLUDES = [
@@ -169,6 +193,185 @@ def module_keys(path: str) -> list[str]:
     return keys
 
 
+# Lexical tokens blanked before the structural regexes run. Strings are
+# line-local (an unescaped JS string cannot span lines), so a stray
+# apostrophe in JSX text or a regex literal misleads at most one line.
+# Known gaps: regex literals are not tokenised, and a template literal
+# nested inside `${}` pairs off with the wrong backtick.
+_JS_TOKENS = re.compile(
+    r"/\*.*?\*/"  # block comment
+    r"|//[^\n]*"  # line comment
+    r'|"(?:[^"\\\n]|\\.)*"'  # double-quoted string
+    r"|'(?:[^'\\\n]|\\.)*'"  # single-quoted string
+    r"|`(?:[^`\\]|\\.)*`",  # template literal
+    re.DOTALL,
+)
+# Code ending like this right before a string token makes that string an
+# import specifier: `import x from`, `import`, `export * from`, `require(`,
+# `import(`.
+_JS_IMPORT_TAIL = re.compile(r"(?:\b(?:from|import)|\b(?:require|import)\s*\()$")
+_VUE_SCRIPT = re.compile(
+    r"""<script\b(?:[^>"']|"[^"]*"|'[^']*')*>(.*?)</script\s*>""",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_JS_ID = r"[A-Za-z_$][\w$]*"
+# One nesting level (<T extends A<B>>); `=>` is a unit so function types
+# such as <T extends () => void> do not read as a closing bracket.
+_JS_GENERIC = r"<(?:=>|[^<>]|<(?:=>|[^<>])*>)*>"
+_JS_PARAMS = r"\((?:[^()]|\([^()]*\))*\)"  # one nesting level: (a = f(1))
+# Statement keywords that also read as `name(...) {`.
+_JS_NOT_A_METHOD = (
+    r"(?!(?:if|for|while|switch|catch|function|return|else|do|try|with)\b)"
+)
+# Each pattern is line-anchored, so `const f = function g() {}` counts once
+# (as a binding) and a call like `foo(x)` never reads as a method.
+JS_DEF_PATTERNS = (
+    # [export [default]] [async] function [*] name(
+    re.compile(
+        r"^[ \t]*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\b\s*\*?\s*"
+        + _JS_ID
+        + r"\s*(?:"
+        + _JS_GENERIC
+        + r"\s*)?\(",
+        re.MULTILINE,
+    ),
+    # [export [default]] [abstract] class Name
+    re.compile(
+        r"^[ \t]*(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+"
+        + _JS_ID
+        + r"\b",
+        re.MULTILINE,
+    ),
+    # [export] const|let|var name[: Type] = [async] function | (params) => | x =>
+    re.compile(
+        r"^[ \t]*(?:export\s+)?(?:const|let|var)\s+"
+        + _JS_ID
+        + r"\s*(?::(?:[^=\n]|=>)*)?=(?!>)\s*(?:async\s+)?(?:function\b|(?:"
+        + _JS_GENERIC
+        + r"\s*)?"
+        + _JS_PARAMS
+        + r"\s*(?::[^=\n]*)?=>|"
+        + _JS_ID
+        + r"\s*=>)",
+        re.MULTILINE,
+    ),
+    # [modifiers] name(params)[: Type] {   (class and object-literal methods)
+    re.compile(
+        r"^[ \t]*(?:(?:public|private|protected|static|async|readonly|override|get|set)\s+"
+        r"|\*\s*)*"
+        + _JS_NOT_A_METHOD
+        + r"#?"
+        + _JS_ID
+        + r"\s*(?:"
+        + _JS_GENERIC
+        + r"\s*)?"
+        + _JS_PARAMS
+        + r"\s*(?::(?:[^{=\n]|=>)*)?\{",
+        re.MULTILINE,
+    ),
+)
+
+
+def vue_script_source(text: str) -> str:
+    """Concatenated <script> block bodies of a Vue single-file component."""
+    return "\n".join(_VUE_SCRIPT.findall(text))
+
+
+def js_scan(source: str) -> tuple[str, set[str]]:
+    """Blank comments and string contents; collect import specifiers on the way.
+
+    A string token is an import specifier when the code just before it ends
+    in `from`, `import`, `require(` or `import(`. Reading the token stream
+    means commented-out imports never count, strings containing `import`
+    never count, and multi-line import lists need no special casing.
+    Returns (blanked source, specifiers); blanking keeps newlines so the
+    line-anchored def patterns see the original line structure.
+    """
+    out: list[str] = []
+    specs: set[str] = set()
+    tail = ""  # code since the last string token (bounded; comments -> " ")
+    pos = 0
+    for m in _JS_TOKENS.finditer(source):
+        gap = source[pos : m.start()]
+        tok = m.group()
+        newlines = "\n" * tok.count("\n")
+        out.append(gap)
+        tail = (tail + gap)[-128:]
+        if tok[0] == "/":
+            out.append(" " + newlines)
+            tail += " "
+        else:
+            # Template literals are dynamic paths; only quoted specifiers count.
+            if tok[0] != "`" and _JS_IMPORT_TAIL.search(tail.rstrip()):
+                specs.add(tok[1:-1])
+            out.append(tok[0] + newlines + tok[0])
+            tail = ""
+        pos = m.end()
+    out.append(source[pos:])
+    return "".join(out), specs
+
+
+def resolve_js_import(importer: str, spec: str, fileset: frozenset[str]) -> str | None:
+    """Analysed file a JS import specifier denotes, or None (external/unknown).
+
+    Relative specifiers resolve against the importer's directory; `@/` and
+    `~/` aliases against src/ and then the repo root. Each base is tried as
+    an exact file, then with each source extension appended, then as a
+    directory index. A `.js` specifier may also mean its `.ts`/`.tsx`
+    source (TypeScript ESM convention). Bare package names are external.
+    """
+    spec = spec.split("?", 1)[0]  # Vite-style `./x?raw` suffixes
+    if spec.startswith(("./", "../")) or spec in (".", ".."):
+        bases = [posixpath.normpath(posixpath.join(posixpath.dirname(importer), spec))]
+    elif spec.startswith(("@/", "~/")):
+        bases = [posixpath.normpath(posixpath.join("src", spec[2:]))]
+        bases.append(posixpath.normpath(spec[2:]))
+    else:
+        return None
+    for base in bases:
+        candidates = [base] if posixpath.splitext(base)[1] in JS_EXTS else []
+        if base.endswith(".js"):
+            candidates += [base[:-3] + ".ts", base[:-3] + ".tsx"]
+        candidates += [base + ext for ext in JS_RESOLVE_EXTS]
+        candidates += [
+            posixpath.normpath(posixpath.join(base, "index" + ext))
+            for ext in JS_RESOLVE_EXTS
+        ]
+        for candidate in candidates:
+            if candidate in fileset:
+                return candidate
+    return None
+
+
+def js_structure(root: str, path: str, fileset: frozenset[str]) -> tuple[int, set[str]]:
+    """Return (defs, resolved import target paths) for a JS/TS/Vue file.
+
+    Regex-based, so a heuristic: defs are line-anchored function and class
+    declarations, const/let/var-bound arrow or function expressions, and
+    class or object-literal methods (`name(params) {`). Callbacks, class
+    fields holding arrows, and `prop: () => ...` values are not counted.
+    Targets are limited to `fileset`, the analysed files; self-imports and
+    bare package specifiers never count.
+    """
+    try:
+        with open(os.path.join(root, path), encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except OSError as e:
+        print(f"warning: cannot read {path}: {e}", file=sys.stderr)
+        return 0, set()
+    if path.endswith(".vue"):
+        source = vue_script_source(source)
+    blanked, specs = js_scan(source)
+    defs = sum(1 for pat in JS_DEF_PATTERNS for _ in pat.finditer(blanked))
+    targets = set()
+    for spec in specs:
+        target = resolve_js_import(path, spec, fileset)
+        if target is not None and target != path:
+            targets.add(target)
+    return defs, targets
+
+
 def churn_and_coupling(
     root: str,
     files: list[str],
@@ -265,8 +468,9 @@ def analyse(
     """Collect all signals for every source file and rank by composite score.
 
     Every row carries the full five-signal vector (0-filled where a signal
-    does not apply, e.g. defs/fan-in/fan-out for non-Python files) so
-    consumers that paste rows as evidence always see a stable schema.
+    does not apply, e.g. defs/fan-in/fan-out for languages without
+    structural analysis such as Go or Ruby) so consumers that paste rows
+    as evidence always see a stable schema.
     """
     files = tracked_source_files(root, excludes)
     if not files:
@@ -284,17 +488,28 @@ def analyse(
         for p in files
     }
 
-    imports_of = {}
+    # Per-file set of resolved import TARGET PATHS, for every language with
+    # structural analysis. JS/TS/Vue targets are paths straight away;
+    # Python module names are resolved below.
+    fileset = frozenset(files)
+    targets_of: dict[str, set[str]] = {}
+    py_imports: dict[str, set[str]] = {}
     for p in files:
-        if p.endswith(".py"):
+        ext = os.path.splitext(p)[1]
+        if ext == ".py":
             defs, imports = py_structure(root, p)
-            rows[p]["defs"] = defs
-            imports_of[p] = imports
+            py_imports[p] = imports
+        elif ext in JS_EXTS:
+            defs, targets = js_structure(root, p, fileset)
+            targets_of[p] = targets
+        else:
+            continue
+        rows[p]["defs"] = defs
 
-    # Fan-in/out resolved against project module names only. Each path is
-    # indexed under all its keys (src/-stripped variants included).
+    # Python fan-in/out resolved against project module names only. Each
+    # path is indexed under all its keys (src/-stripped variants included).
     mod_to_path = {}
-    for p in imports_of:
+    for p in py_imports:
         for key in module_keys(p):
             other = mod_to_path.get(key)
             if other is not None and other != p:
@@ -305,8 +520,7 @@ def analyse(
                 )
                 continue
             mod_to_path[key] = p
-    fan_in = defaultdict(int)
-    for p, imports in imports_of.items():
+    for p, imports in py_imports.items():
         internal = set()
         for imp in imports:
             # `from pkg.mod import x` may reference pkg.mod or pkg.mod.x's parent.
@@ -315,10 +529,15 @@ def analyse(
                 if target and target != p:
                     internal.add(target)
                     break
-        rows[p]["fan_out"] = len(internal)
-        for target in internal:
+        targets_of[p] = internal
+
+    # One shared pass turns target sets into fan-out and fan-in.
+    fan_in = defaultdict(int)
+    for p, targets in targets_of.items():
+        rows[p]["fan_out"] = len(targets)
+        for target in targets:
             fan_in[target] += 1
-    for p in imports_of:
+    for p in files:
         rows[p]["fan_in"] = fan_in[p]
 
     churn, coupling = churn_and_coupling(
@@ -374,12 +593,62 @@ def load_baseline(path: str) -> dict[str, int | float]:
     return baseline
 
 
+def load_config(path: str) -> dict[str, object]:
+    """Load and validate the .kokko.json keys this script reads.
+
+    Other tools share the file, so unknown keys are ignored and only the
+    keys used here are validated. Like load_baseline, a malformed value
+    fails with a one-line message naming the file, never a traceback from
+    deep inside analyse(). A JSON syntax error propagates as
+    json.JSONDecodeError for main()'s handler to report.
+    """
+    if not os.path.isfile(path):
+        sys.exit(f"error: config {path}: no such file")
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        sys.exit(
+            f"error: config {path}: must contain a JSON object, "
+            f"got {type(raw).__name__}"
+        )
+    config: dict[str, object] = {}
+    excludes = raw.get("excludes")
+    if excludes is not None:
+        if not isinstance(excludes, list) or not all(
+            isinstance(x, str) for x in excludes
+        ):
+            sys.exit(
+                f"error: config {path}: excludes must be a list of strings, "
+                f"got {excludes!r}"
+            )
+        config["excludes"] = excludes
+    janitor = raw.get("janitor")
+    if janitor is not None:
+        if not isinstance(janitor, dict):
+            sys.exit(
+                f"error: config {path}: janitor must be a JSON object, "
+                f"got {type(janitor).__name__}"
+            )
+        for key in ("candidate_loc", "candidate_defs"):
+            value = janitor.get(key)
+            if value is None:
+                continue
+            # bool is an int subclass, but `true` here means a corrupted file.
+            if isinstance(value, bool) or not isinstance(value, int):
+                sys.exit(
+                    f"error: config {path}: janitor.{key} must be an integer, "
+                    f"got {value!r}"
+                )
+            config[key] = value
+    return config
+
+
 def ratchet(
     report: dict[str, list[dict[str, object]]], path: str, update: bool
 ) -> tuple[dict[str, int], dict[str, int | float], dict[str, tuple[int | float, int]]]:
     """Compare absolute structural metrics against the stored baseline."""
-    # Rows always carry the full signal vector (0-filled for non-Python
-    # files), so the maxima over all files equal the maxima over Python ones.
+    # Rows always carry the full signal vector (0-filled where a language
+    # has no structural analysis), so the maxima are taken over all files.
     current = {
         "max_file_loc": max((r["loc"] for r in report["files"]), default=0),
         "max_fan_in": max((r["fan_in"] for r in report["files"]), default=0),
@@ -421,17 +690,21 @@ def main() -> None:
         default=[],
         help="extra exclude glob (repeatable)",
     )
+    # Defaults are None so a .kokko.json value can fill in; an explicit flag
+    # always wins. The help text still names the built-in defaults.
     ap.add_argument(
         "--candidate-loc",
         type=int,
-        default=400,
-        help="absolute LOC threshold for the candidate flag (default 400)",
+        default=None,
+        help="absolute LOC threshold for the candidate flag "
+        f"(default {DEFAULT_CANDIDATE_LOC})",
     )
     ap.add_argument(
         "--candidate-defs",
         type=int,
-        default=30,
-        help="absolute defs-per-file threshold for the candidate flag (default 30)",
+        default=None,
+        help="absolute defs-per-file threshold for the candidate flag "
+        f"(default {DEFAULT_CANDIDATE_DEFS})",
     )
     ap.add_argument(
         "--churn-top",
@@ -467,6 +740,11 @@ def main() -> None:
         action="store_true",
         help="tighten the scorecard to current values (no-op on regression)",
     )
+    ap.add_argument(
+        "--config",
+        help=f"per-repo config JSON (default: <root>/{CONFIG_FILENAME} when "
+        "present; relative paths resolve against the repo root)",
+    )
     args = ap.parse_args()
     if args.update and not args.scorecard:
         ap.error("--update requires --scorecard")
@@ -479,9 +757,28 @@ def main() -> None:
     except subprocess.CalledProcessError as e:
         sys.exit(f"error: git cannot read {root}: {e.stderr.strip()}")
 
-    report = analyse(root, DEFAULT_EXCLUDES + args.exclude, args.since, args)
+    # A missing default config is silently ignored; a missing explicit
+    # --config path is an error (load_config reports it).
+    config_path = args.config
+    if config_path is None:
+        default_config = os.path.join(root, CONFIG_FILENAME)
+        if os.path.isfile(default_config):
+            config_path = default_config
+    elif not os.path.isabs(config_path):
+        config_path = os.path.join(root, config_path)
+    if config_path is not None:
+        config_path = os.path.abspath(config_path)
+    config = load_config(config_path) if config_path else {}
+    if args.candidate_loc is None:
+        args.candidate_loc = config.get("candidate_loc", DEFAULT_CANDIDATE_LOC)
+    if args.candidate_defs is None:
+        args.candidate_defs = config.get("candidate_defs", DEFAULT_CANDIDATE_DEFS)
+    excludes = DEFAULT_EXCLUDES + list(config.get("excludes", [])) + args.exclude
+
+    report = analyse(root, excludes, args.since, args)
     out = {
         "root": root,
+        "config": config_path,
         "top": report["files"][: args.top],
         "coupling": report["coupling"],
         "files_analysed": len(report["files"]),

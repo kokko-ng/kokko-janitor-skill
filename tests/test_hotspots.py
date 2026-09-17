@@ -208,8 +208,9 @@ def test_candidate_flag_at_thresholds(tmp_path):
 
 
 def test_score_uses_fixed_signal_vector(tmp_path):
-    # A non-Python file must not out-rank by dilution: its score is computed
-    # over the same five-signal vector with defs/fan_in/fan_out zero-filled.
+    # A file with no structural signals (small.ts defines and imports nothing)
+    # must not out-rank by dilution: its score is computed over the same
+    # five-signal vector with defs/fan_in/fan_out zero-filled.
     repo = make_repo(
         tmp_path,
         {
@@ -294,12 +295,13 @@ def test_scorecard_values_must_be_numeric(tmp_path):
 
 
 def test_every_row_has_all_five_signal_keys(tmp_path):
-    # Non-Python files must still emit defs/fan_in/fan_out (as 0), so
+    # Files in a language without structural analysis (Go here; Python and
+    # JS/TS/Vue are analysed) must still emit defs/fan_in/fan_out (as 0), so
     # consumers pasting rows as evidence always see the same schema.
-    repo = make_repo(tmp_path, {"web/app.ts": "let x = 1;\n"})
+    repo = make_repo(tmp_path, {"svc/main.go": "package main\n"})
     proc, report = run_script(repo, "--top", "20")
     assert proc.returncode == 0
-    row = rows_by_path(report)["web/app.ts"]
+    row = rows_by_path(report)["svc/main.go"]
     for key in ("loc", "defs", "fan_in", "fan_out", "churn"):
         assert key in row
     assert row["defs"] == 0
@@ -470,3 +472,221 @@ def test_from_dot_import_names_resolve(tmp_path):
     assert rows["pkg/user.py"]["fan_out"] == 2
     assert rows["pkg/db.py"]["fan_in"] == 1
     assert rows["pkg/__init__.py"]["fan_in"] == 1
+
+
+def test_vue_files_are_indexed_and_script_blocks_analysed(tmp_path):
+    # Structure (defs, imports) comes from the <script> blocks only, but LOC
+    # still counts the whole file, template included.
+    vue = (
+        '<script setup lang="ts">\n'
+        "import { util } from './util.ts';\n"
+        "\n"
+        "function helper() {\n"
+        "  return util();\n"
+        "}\n"
+        "</script>\n"
+        "\n"
+        '<script lang="ts">\n'
+        "export default { name: 'App' };\n"
+        "</script>\n"
+        "\n"
+        "<template>\n"
+        "  <div>{{ helper() }}</div>\n"
+        "</template>\n"
+    )
+    repo = make_repo(
+        tmp_path,
+        {
+            "src/App.vue": vue,
+            "src/util.ts": "export function util() {\n  return 1;\n}\n",
+        },
+    )
+    proc, report = run_script(repo, "--top", "20")
+    assert proc.returncode == 0
+    rows = rows_by_path(report)
+    assert rows["src/App.vue"]["defs"] >= 1
+    assert rows["src/App.vue"]["fan_out"] == 1
+    assert rows["src/App.vue"]["loc"] == 12
+    assert rows["src/util.ts"]["fan_in"] == 1
+
+
+def test_js_defs_count_functions_classes_arrows_and_methods(tmp_path):
+    # One function declaration, one class with two methods (constructor +
+    # one), one const arrow: 5. The `if (name) {` line, the comments and
+    # the string/template contents must not count.
+    source = (
+        "// function notCounted() {\n"
+        "const label = 'class NotCounted';\n"
+        "/*\n"
+        "function alsoNotCounted() {\n"
+        "}\n"
+        "*/\n"
+        "const doc = `\n"
+        "class NotCounted {\n"
+        "  method() {\n"
+        "  }\n"
+        "}\n"
+        "`;\n"
+        "\n"
+        "export function greet(name: string): string {\n"
+        "  return `hi ${name}`;\n"
+        "}\n"
+        "\n"
+        "export class Greeter {\n"
+        "  private prefix: string;\n"
+        "\n"
+        "  constructor(prefix: string) {\n"
+        "    this.prefix = prefix;\n"
+        "  }\n"
+        "\n"
+        "  greet(name: string): string {\n"
+        "    if (name) {\n"
+        "      return this.prefix + name + label + doc;\n"
+        "    }\n"
+        "    return this.prefix;\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "export const shout = (text: string): string => text.toUpperCase();\n"
+    )
+    repo = make_repo(tmp_path, {"src/greeter.ts": source})
+    proc, report = run_script(repo, "--top", "20")
+    assert proc.returncode == 0
+    assert rows_by_path(report)["src/greeter.ts"]["defs"] == 5
+
+
+def test_js_relative_imports_resolve_extensions_and_index(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {
+            "src/a.ts": (
+                "import { b } from './b';\n"
+                "import { d } from './dir';\n"
+                "import { c } from './c.js';\n"
+                "import _ from 'lodash';\n"
+                "// import { z } from './z';\n"
+                "export const a = [b, d, c, _];\n"
+            ),
+            "src/b.ts": "export const b = 1;\n",
+            "src/dir/index.ts": "export const d = 1;\n",
+            "src/c.ts": "export const c = 1;\n",
+            "src/z.ts": "export const z = 1;\n",
+        },
+    )
+    proc, report = run_script(repo, "--top", "20")
+    assert proc.returncode == 0
+    rows = rows_by_path(report)
+    # ./b -> src/b.ts, ./dir -> src/dir/index.ts, ./c.js -> src/c.ts (TS ESM
+    # convention); lodash is external and the commented-out import is ignored.
+    assert rows["src/a.ts"]["fan_out"] == 3
+    assert rows["src/b.ts"]["fan_in"] == 1
+    assert rows["src/dir/index.ts"]["fan_in"] == 1
+    assert rows["src/c.ts"]["fan_in"] == 1
+    assert rows["src/z.ts"]["fan_in"] == 0
+
+
+def test_js_alias_imports_resolve_against_src(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {
+            "src/x.ts": "import { y } from '@/y';\nexport const x = y;\n",
+            "src/y.ts": "export const y = 1;\n",
+        },
+    )
+    proc, report = run_script(repo, "--top", "20")
+    assert proc.returncode == 0
+    rows = rows_by_path(report)
+    assert rows["src/x.ts"]["fan_out"] == 1
+    assert rows["src/y.ts"]["fan_in"] == 1
+
+
+def test_config_excludes_and_thresholds_apply(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {
+            "gen/schema.py": "x = 1\n",
+            "big.py": "x = 1\n" * 6,
+            "small.py": "x = 1\n" * 4,
+        },
+    )
+    config = {
+        "excludes": ["gen/*"],
+        "janitor": {"candidate_loc": 5},
+        # Other tools share the file; their keys are ignored.
+        "other_tool": {"anything": True},
+    }
+    (repo / ".kokko.json").write_text(json.dumps(config) + "\n", encoding="utf-8")
+
+    proc, report = run_script(repo, "--top", "20")
+    assert proc.returncode == 0
+    rows = rows_by_path(report)
+    assert "gen/schema.py" not in rows
+    assert rows["big.py"]["candidate"] is True
+    assert rows["small.py"]["candidate"] is False
+    assert report["files_analysed"] == 2
+    assert report["config"].endswith(".kokko.json")
+
+
+def test_cli_flag_overrides_config_threshold(tmp_path):
+    repo = make_repo(tmp_path, {"big.py": "x = 1\n" * 6})
+    config = {"janitor": {"candidate_loc": 5}}
+    (repo / ".kokko.json").write_text(json.dumps(config) + "\n", encoding="utf-8")
+
+    proc, report = run_script(repo, "--top", "20", "--candidate-loc", "1000")
+    assert proc.returncode == 0
+    assert rows_by_path(report)["big.py"]["candidate"] is False
+
+
+def test_no_config_reports_null(tmp_path):
+    repo = make_repo(tmp_path, {"a.py": "x = 1\n"})
+    proc, report = run_script(repo, "--top", "20")
+    assert proc.returncode == 0
+    assert report["config"] is None
+
+
+def test_explicit_missing_config_is_an_error(tmp_path):
+    # A missing default .kokko.json is silently ignored; a missing explicit
+    # --config path is not. Relative paths resolve against the repo root,
+    # not the cwd, like --scorecard.
+    repo = make_repo(tmp_path, {"a.py": "x = 1\n"})
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    proc, _ = run_script(repo, "--config", "missing.json", cwd=elsewhere)
+    assert proc.returncode == 1
+    assert "error: config" in proc.stderr
+    assert str(repo / "missing.json") in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_config_must_be_an_object(tmp_path):
+    repo = make_repo(tmp_path, {"a.py": "x = 1\n"})
+    (repo / ".kokko.json").write_text("[1, 2, 3]\n", encoding="utf-8")
+
+    proc, _ = run_script(repo)
+    assert proc.returncode == 1
+    assert "error: config" in proc.stderr
+    assert str(repo / ".kokko.json") in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_config_threshold_must_be_an_int(tmp_path):
+    repo = make_repo(tmp_path, {"a.py": "x = 1\n"})
+    config = {"janitor": {"candidate_loc": True}}
+    (repo / ".kokko.json").write_text(json.dumps(config) + "\n", encoding="utf-8")
+
+    proc, _ = run_script(repo)
+    assert proc.returncode == 1
+    assert "error: config" in proc.stderr
+    assert "candidate_loc" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_malformed_config_is_an_invalid_json_error(tmp_path):
+    repo = make_repo(tmp_path, {"a.py": "x = 1\n"})
+    (repo / ".kokko.json").write_text('{"excludes": [', encoding="utf-8")
+
+    proc, _ = run_script(repo)
+    assert proc.returncode == 1
+    assert "error: invalid JSON" in proc.stderr
+    assert "Traceback" not in proc.stderr
