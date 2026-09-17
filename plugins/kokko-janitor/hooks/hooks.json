@@ -1,0 +1,25 @@
+{
+  "description": "Progress-file guard: keeps an autonomous pass working while a prompts/*-progress.md in the working directory still lists open items.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/progress-guard.sh"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/progress-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
