@@ -1,215 +1,295 @@
 # Git Worktree Orchestration Workflow
 
-This document details the worktree-based parallel quality check workflow.
+Mechanics for the janitor skill: run state, preflight, worktrees, worker
+briefs, hold and resume, merging, cleanup, and error recovery.
 
 ## Prerequisites
 
-- Git repository with clean working tree
-- All quality tools installed (or will be installed per tool)
+- Git repository with a clean working tree (a dry run needs only a
+  repository)
+- `jq` for reading `.kokko.json` and `.janitor/run.json`
+- The `kokko-code-quality` plugin installed, for the lint layer
 
-## Step 1: Preparation
+## Run state
 
-```bash
-# Verify clean working tree
-git status --porcelain
-# Should be empty
+`.janitor/run.json` is the one record of an in-flight run. It exists so a
+crash, a compaction, or a `--hold` never strands worktrees nobody can find
+again. Write it when Phase 1 starts, update it at every phase boundary and
+every worker completion, and delete it in Cleanup.
 
-# Get current branch as default target
-TARGET_BRANCH=$(git branch --show-current)
-
-# Create worktree base directory
-WORKTREE_BASE=$(mktemp -d)
-echo "Worktree base: $WORKTREE_BASE"
+```json
+{
+  "started": "2026-09-17T10:00:00Z",
+  "target_branch": "main",
+  "worktree_base": "/tmp/tmp.k3Qx1a",
+  "args": {"langs": ["py"], "checks": ["security", "types"], "top": 3,
+           "apply_design": false, "max_rounds": 1},
+  "phase": "lint",
+  "round": 1,
+  "checks": {
+    "py-security": {"worktree": "/tmp/tmp.k3Qx1a/py-security",
+                    "branch": "janitor/py-security",
+                    "status": "fixed", "commits": 2, "note": ""},
+    "py-types": {"worktree": "/tmp/tmp.k3Qx1a/py-types",
+                 "branch": "janitor/py-types",
+                 "status": "running", "commits": 0, "note": ""}
+  },
+  "design": {
+    "src/big.py": {"worktree": "/tmp/tmp.k3Qx1a/design-big",
+                   "branch": "janitor/design-big",
+                   "verdict": "god-module", "votes": ["ACCEPT", "REJECT", "ACCEPT"],
+                   "plan": ".janitor/design-plan-big.md", "applied": false}
+  }
+}
 ```
 
-## Step 2: Detect Languages
+`phase` is one of `lint`, `design`, `hold`, `merge`, `ratchet`. A check
+`status` is `pending`, `running`, `clean`, `fixed`, `failed`, or `merged`.
+Absolute paths only: a resumed run may start from a different shell.
 
-Check which languages are present:
+Keep the file untracked and out of `git status` through the repository's
+shared exclude file (never its tracked `.gitignore`):
+
+```bash
+# --git-path resolves to the shared info/exclude even inside a worktree
+exclude="$(git rev-parse --git-path info/exclude)"
+git check-ignore -q .janitor/run.json 2>/dev/null || echo '.janitor/run.json' >> "$exclude"
+git check-ignore -q .janitor/design-plan-probe.md 2>/dev/null || echo '.janitor/design-plan-*.md' >> "$exclude"
+```
+
+Only those two patterns. The scorecard, `.janitor/scorecard.json`, is meant
+to be committed, so a blanket `.janitor/` entry would hide a first-run
+scorecard from `git status`.
+
+## Preflight
+
+```bash
+# Per-repo config (optional); flags override every value
+[ -f .kokko.json ] && jq '{languages, checks, janitor}' .kokko.json
+
+# Leftovers of an earlier run
+git worktree list --porcelain
+git branch --list 'janitor/*'
+ls .janitor/run.json 2>/dev/null
+
+# Clean working tree (skipped by --dry-run)
+git status --porcelain
+
+# Current branch as the default target
+git branch --show-current
+```
+
+Any `janitor/*` branch, any worktree under a previous `worktree_base`, or a
+`run.json` without `--resume` means an earlier run did not finish. Stop and
+report; do not clean up. Print exactly this for the user:
+
+```text
+A previous janitor run left work behind. Either continue it:
+    /kokko-janitor:janitor --resume
+or inspect and clear it by hand (each branch may hold uncollected fixes):
+    git worktree list
+    git log --oneline <target>..janitor/<name>       # per branch
+    git worktree remove <path>                       # plain remove, never --force
+    git branch -d janitor/<name>                     # -d, never -D
+    rm .janitor/run.json
+```
+
+## Detect languages
 
 ```bash
 # Explicit if-statements, not `[ ... ] || [ ... ] && echo`: that bare
 # compound exits non-zero when the test fails, which aborts a `set -e`
 # shell (and `A || B && C` groups as `(A || B) && C`, not `A || (B && C)`).
-# Python
 if [ -f pyproject.toml ] || [ -f setup.py ]; then echo "py"; fi
-
-# JavaScript/TypeScript
-if [ -f package.json ]; then echo "js"; fi
-
-# .NET
+if [ -f package.json ] || [ -f tsconfig.json ]; then echo "js"; fi
 if [ -n "$(git ls-files '*.csproj' '*.sln')" ]; then echo "dotnet"; fi
 ```
 
-## Step 3: Create Worktrees
+`languages` in `.kokko.json` or `--langs` replaces detection entirely.
 
-For each language + check combination:
+## Create worktrees
 
 ```bash
-# Example for Python security
+WORKTREE_BASE=$(mktemp -d)
 git worktree add "$WORKTREE_BASE/py-security" -b janitor/py-security
-
-# Example for JavaScript types
 git worktree add "$WORKTREE_BASE/js-types" -b janitor/js-types
 ```
 
-Create all needed worktrees upfront to allow parallel execution.
+Create every worktree up front, recording each in `run.json`, then launch
+all workers together.
 
-## Step 4: Launch Subagents
+## Launch workers
 
-Spawn one subagent per worktree using the Task tool. A subagent starts in
-the repo root, not in its worktree, and a `cd` is easy to lose across Bash
-calls. Brief each subagent to use absolute paths everywhere and
-`git -C "$WORKTREE"` for every git command:
-
-Always invoke the check skills by their namespaced name
-(`/kokko-code-quality:security`, not `/security`) — the bare short name
-only resolves while no other plugin defines the same generic word, and a
-collision silently runs the wrong skill.
+Spawn one `kokko-janitor:worktree-worker` agent per worktree, all in one
+parallel batch. The agent carries the git rules and the worktree discipline
+(absolute paths, `git -C`), so a brief is short:
 
 ```text
-Task: Run /kokko-code-quality:security py in worktree
-Prompt: WORKTREE=$WORKTREE_BASE/py-security (absolute path — you start
-        in the repo root, not in the worktree; reference files by
-        absolute path under "$WORKTREE" and run every git command as
-        git -C "$WORKTREE" ...). Run /kokko-code-quality:security py
-        against that worktree. Fix ALL issues found, commit
-        incrementally with git -C "$WORKTREE" commit.
+WORKTREE: /tmp/tmp.k3Qx1a/py-security
+BRANCH: janitor/py-security
+RUN: /kokko-code-quality:security py
+Fix everything the check finds and commit in the check's own message format.
 ```
 
-Launch all subagents in parallel for maximum efficiency.
+A dry-run brief differs in two lines:
 
-## Step 5: Monitor Progress
+```text
+WORKTREE: <repo root>   (REPORT-ONLY: edit nothing, commit nothing)
+RUN: /kokko-code-quality:security py --report
+```
 
-Track subagent completion:
+Design briefs add the evidence:
 
-- Collect each subagent's final report as it finishes — that report is
-  the only record of what the agent found, fixed, and committed
-- Note any failures or blockers
-- Count issues fixed per agent
+```text
+WORKTREE: /tmp/tmp.k3Qx1a/design-big
+BRANCH: janitor/design-big
+RUN: /kokko-janitor:design src/big.py
+EVIDENCE: <the candidate's row from the Phase 0 JSON, plus its coupling pairs>
+```
 
-## Step 6: Merge Strategy
+Judge briefs go to `kokko-janitor:design-judge`, three per plan, in parallel:
 
-### Simple Merge (Preferred)
+```text
+MODULE: /tmp/tmp.k3Qx1a/design-big/src/big.py
+PLAN: /tmp/tmp.k3Qx1a/design-big/.janitor/design-plan-big.md
+EVIDENCE: <same row>
+```
+
+## Monitor
+
+Record each worker's final report in `run.json` as it lands: it is the only
+record of what that worker found, fixed, and committed. Note failures and
+blockers; count fixes per worker for the final report.
+
+## Hold
+
+With `--hold`, once every worker has reported: set `phase` to `hold`, keep
+every worktree and branch, and stop with a summary table (branch, status,
+commits, one-line description) and the merge commands below, ready to paste.
+Nothing is merged, nothing is deleted.
+
+## Resume
+
+With `--resume`: load `run.json`, then verify before trusting it.
 
 ```bash
-git checkout $TARGET_BRANCH
-
-# Merge each branch
-git merge janitor/py-security --no-ff \
-  -m "chore(quality): merge py security fixes"
-git merge janitor/py-types --no-ff \
-  -m "chore(quality): merge py type fixes"
-# ... continue for all branches
+jq -r '.worktree_base, .phase, (.checks | to_entries[] | "\(.key) \(.value.branch) \(.value.status)")' .janitor/run.json
+git worktree list --porcelain
+git branch --list 'janitor/*'
 ```
 
-### Handling Conflicts
+Every recorded worktree path and branch must exist; a worktree that is gone
+while its branch remains is fine (the commits are on the branch, recreate
+the worktree only if a worker still has to run there). Then continue:
 
-If merge conflicts occur:
+- `lint` or `design`: re-spawn workers only for checks not marked `clean`,
+  `fixed`, or `merged`, and re-judge only plans without votes
+- `hold`: continue to Merge and Validate
+- `merge`: merge the branches not yet marked `merged`
+- `ratchet`: run the ratchet, then Cleanup
 
-1. **Understand both changes** - Read the conflicting hunks
-2. **Determine intent** - What was each fix trying to accomplish?
-3. **Resolve preserving both** - Usually both fixes are valid
-4. **Complete merge** - stage ONLY the conflicted files, by explicit
-   path. Never `git add .` and never a directory add: untracked files
-   living beside tracked ones get swept in silently.
+## Merge strategy
 
-   ```bash
-   git diff --name-only --diff-filter=U   # list conflicted files
-   git add -- <each-conflicted-file>
-   git commit -m "chore(quality): resolve merge conflict in <file>"
-   ```
+```bash
+git checkout <target-branch>
+git merge janitor/py-security --no-ff -m "chore(quality): merge py security fixes"
+git merge janitor/py-types --no-ff -m "chore(quality): merge py type fixes"
+# ... smallest changesets first, applied design branches last
+```
 
-### Common Conflict Patterns
+### Handling conflicts
+
+1. Read both hunks and work out what each fix intended
+2. Resolve preserving both intents; usually both are valid
+3. Stage ONLY the conflicted files, by explicit path. Never `git add .` and
+   never a directory add: untracked files beside tracked ones get swept in
+
+```bash
+git diff --name-only --diff-filter=U   # list conflicted files
+git add -- <each-conflicted-file>
+git commit -m "chore(quality): resolve merge conflict in <file>"
+```
 
 | Pattern | Resolution |
 | ------- | ---------- |
 | Same line modified | Keep both if independent, combine if related |
-| Import ordering | Accept either, let formatter fix |
+| Import ordering | Accept either, let the formatter fix |
 | Adjacent lines | Both changes usually apply |
-| Delete vs modify | Prefer the fix unless delete was intentional |
+| Delete vs modify | Prefer the fix unless the delete was intentional |
 
-## Step 7: Cleanup
-
-```bash
-# Remove all worktrees. Plain `git worktree remove` — NEVER --force. Plain
-# remove refuses while a worktree still has modified or untracked files;
-# that refusal is a signal to inspect and copy out anything that matters
-# (a design plan not yet collected, an uncommitted fix), not to force.
-# --force deletes those files along with the worktree, unrecoverably.
-for dir in "$WORKTREE_BASE"/*; do
-  git worktree remove "$dir" \
-    || echo "warning: $dir not removable — inspect its leftover files, collect what matters, then retry"
-done
-
-# Remove base directory. rmdir refuses a non-empty directory — if it
-# fails, something (a leftover worktree, a stray file) survived: inspect
-# and report rather than force-deleting blindly.
-rmdir "$WORKTREE_BASE" || echo "warning: $WORKTREE_BASE not empty — inspect before deleting"
-
-# Delete temporary branches. --format strips the current-branch '*'
-# marker. -d suffices: janitor/* branches were merged --no-ff (their tips
-# are reachable from the target branch) or carry no commits at all, and
-# -d deletes both cleanly. If -d refuses, the branch holds unmerged
-# commits nobody merged — report that as a finding; never escalate to -D,
-# which deletes those commits and the branch's reflog with them.
-# xargs -r (skip empty input) is a GNU extension; modern BSD/macOS xargs
-# accepts it as a no-op.
-git branch --list 'janitor/*' --format='%(refname:short)' | xargs -r git branch -d
-```
-
-## Step 8: Final Validation
-
-Run comprehensive checks on merged result:
+## Final validation
 
 ```bash
 # Python
 uv run pre-commit run --all-files
-
 # JavaScript/TypeScript
 npm run lint
 npm run build
-
 # .NET
 dotnet build -warnaserror
 ```
 
-If no `.pre-commit-config.yaml` exists, fall back to running the
-individual quality tools directly (the same ones the check subagents
-used) plus the test suite, and note the substitution in the report.
+Without a `.pre-commit-config.yaml`, run the individual quality tools the
+workers used plus the test suite, and note the substitution in the report.
 
-Running tests may regenerate build artifacts (compiled SQL, dbt
-`target/`, bundler output). If any of those artifacts are TRACKED, the
-tree will be dirty afterward with machine-generated diffs — often
-polluted with ephemeral test values (temp schema names, timestamps).
-Do NOT commit them. Report them to the user and suggest gitignoring
-the artifact directories as the durable fix.
+Running tests may regenerate build artifacts (compiled SQL, dbt `target/`,
+bundler output). If any are TRACKED, the tree is dirty afterwards with
+machine-generated diffs, often polluted with ephemeral test values. Do NOT
+commit them. Report them and suggest ignoring the artifact directories.
 
-## Error Recovery
-
-### Worktree Creation Fails
-
-If the working tree is dirty, STOP and report to the user. Do NOT run
-`git stash`, `git reset`, `git restore`, or `git checkout -- <path>` to
-clear it — uncommitted tracked changes overwritten by those commands are
-unrecoverable. The user decides whether to commit the work (explicit file
-paths, never `git add .` or a directory add) or abort the run.
-
-### Subagent Fails
-
-1. Check the worktree for partial work
-2. Fix remaining issues manually
-3. Commit and continue with merge
-
-### Merge Fails Completely
+## Cleanup
 
 ```bash
-# Abort merge
-git merge --abort
+# Plain `git worktree remove`, never --force: plain remove refuses while a
+# worktree still has modified or untracked files, which is the signal to
+# inspect and copy out anything that matters (an uncollected plan, an
+# uncommitted fix). --force deletes those files unrecoverably.
+for dir in "$WORKTREE_BASE"/*; do
+  git worktree remove "$dir" \
+    || echo "warning: $dir not removable: inspect its leftover files, collect what matters, then retry"
+done
 
-# Cherry-pick specific commits instead
-git cherry-pick <commit-sha>
+# rmdir refuses a non-empty directory; a failure means something survived.
+rmdir "$WORKTREE_BASE" || echo "warning: $WORKTREE_BASE not empty: inspect before deleting"
+
+# -d suffices: janitor/* branches were merged --no-ff or carry no commits.
+# A -d refusal means unmerged commits nobody merged: report it, never -D.
+# xargs -r (skip empty input) is a GNU extension; modern BSD/macOS xargs
+# accepts it as a no-op.
+git branch --list 'janitor/*' --format='%(refname:short)' | xargs -r git branch -d
+
+rm .janitor/run.json
 ```
 
-Do NOT fall back to `git rebase` — it rewrites history and destroys
-uncommitted tracked changes without prompting. If cherry-picking also
-fails, stop and report the state to the user.
+## Error recovery
+
+### Working tree is dirty
+
+STOP and report. Do NOT run `git stash`, `git reset`, `git restore`, or
+`git checkout -- <path>` to clear it: uncommitted tracked changes
+overwritten by those commands are unrecoverable. The user decides whether to
+commit the work (explicit file paths) or abort the run.
+
+### Leftovers from an earlier run
+
+Report them with the recovery block from Preflight. A run that crashed mid
+way is continued with `--resume`, never restarted over the top of its
+branches.
+
+### A worker fails
+
+1. Record `failed` and the worker's last report in `run.json`
+2. Check its worktree for partial work; commit anything complete by explicit
+   path, or leave the branch unmerged and say so
+3. Continue with the other branches; the failure goes in the final report
+
+### A merge fails completely
+
+```bash
+git merge --abort
+git cherry-pick <commit-sha>   # pick the branch's commits one by one instead
+```
+
+Do NOT fall back to `git rebase`: it rewrites history and destroys
+uncommitted tracked changes without prompting. If cherry-picking also fails,
+leave the branch unmerged, record it, and report the state.
