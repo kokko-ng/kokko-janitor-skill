@@ -33,3 +33,6 @@ tmp/
 # Janitor report-only artifacts (design plans stay untracked by design;
 # the scorecard is NOT listed here because it may be tracked on purpose)
 .janitor/design-plan-*.md
+
+# Eval runs (claude plugin eval) write reports here
+**/evals/results/
