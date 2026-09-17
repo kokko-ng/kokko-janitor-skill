@@ -166,9 +166,8 @@ anything.
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the test suite, pre-commit
-setup, ruff, the eval suite, and the CI-gated release flow. Shared
-infrastructure (release and evals workflows, sync script, prompt linter,
-pre-commit config) follows
+setup, ruff, and the CI-gated release flow. Shared infrastructure (release
+workflow, sync script, prompt linter, pre-commit config) follows
 [kokko-skills](https://github.com/kokko-ng/kokko-skills).
 
 ## License

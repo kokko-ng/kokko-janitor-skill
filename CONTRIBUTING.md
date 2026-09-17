@@ -35,23 +35,6 @@ hook is tested the same way in `tests/test_progress_guard.py`.
   branch, skill invocation, and evidence.
 - `hooks/`: the progress guard (`hooks.json` registers it for Stop and
   SubagentStop).
-- `evals/<case>/`: `claude plugin eval` cases with scaffold scripts.
-
-## Evals
-
-`plugins/kokko-janitor/evals/` holds behavioral regression cases: chained
-multipass targets run in order, and a dirty tree stops the janitor before
-any worktree exists. Run them locally (they spend API credit on your own
-account):
-
-```bash
-claude plugin eval plugins/kokko-janitor --trust-plugin --scaffold \
-  --allow-tools Bash Write Edit --no-publish --ablation none
-```
-
-`.github/workflows/evals.yml` runs the suite weekly and on demand when the
-`ANTHROPIC_API_KEY` repository secret exists, with a cost ceiling. It is
-deliberately not part of the per-PR CI.
 
 ## Release flow (CI-gated)
 
@@ -67,8 +50,8 @@ deliberately not part of the per-PR CI.
 
 ## Shared infrastructure
 
-The shared infra here (release and evals workflows, marketplace sync
-script, prompt linter, pre-commit config, gitignore) follows
+The shared infra here (release workflow, marketplace sync script, prompt
+linter, pre-commit config, gitignore) follows
 [kokko-skills](https://github.com/kokko-ng/kokko-skills), which holds the
 reference copies. When changing any of it, keep the two repos convergent.
 The CI job that checks cross-repo references clones kokko-skills next to
